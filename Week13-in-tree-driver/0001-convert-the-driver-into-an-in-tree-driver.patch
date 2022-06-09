@@ -1,0 +1,1072 @@
+From 7a2f87fc2f466f7dab0745a93dd76b98dbd86a5f Mon Sep 17 00:00:00 2001
+From: Dexuan Cui <decui@microsoft.com>
+Date: Thu, 9 Jun 2022 05:18:29 +0000
+Subject: [PATCH] convert the driver into an in-tree driver.
+
+---
+ drivers/Makefile                     |   1 +
+ drivers/week13/Makefile              |   7 +
+ drivers/week13/README                |  25 ++
+ drivers/week13/lsg_fake_bus.c        | 209 +++++++++++++++
+ drivers/week13/lsg_fake_device.c     | 171 +++++++++++++
+ drivers/week13/lsg_fake_device_drv.c | 368 +++++++++++++++++++++++++++
+ drivers/week13/lsgfk_public.h        | 161 ++++++++++++
+ include/linux/mod_devicetable.h      |   5 +
+ scripts/mod/devicetable-offsets.c    |   3 +
+ scripts/mod/file2alias.c             |  11 +
+ 10 files changed, 961 insertions(+)
+ create mode 100644 drivers/week13/Makefile
+ create mode 100644 drivers/week13/README
+ create mode 100644 drivers/week13/lsg_fake_bus.c
+ create mode 100644 drivers/week13/lsg_fake_device.c
+ create mode 100644 drivers/week13/lsg_fake_device_drv.c
+ create mode 100644 drivers/week13/lsgfk_public.h
+
+diff --git a/drivers/Makefile b/drivers/Makefile
+index a110338c860c..faf24ad0a656 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -187,3 +187,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
+ obj-$(CONFIG_INTERCONNECT)	+= interconnect/
+ obj-$(CONFIG_COUNTER)		+= counter/
+ obj-$(CONFIG_MOST)		+= most/
++obj-y += week13/
+diff --git a/drivers/week13/Makefile b/drivers/week13/Makefile
+new file mode 100644
+index 000000000000..11cc5b69c4bd
+--- /dev/null
++++ b/drivers/week13/Makefile
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0
++
++obj-m	+= lsg_bus.o 
++obj-m	+= lsg_fake_device_drv.o
++
++lsg_bus-y := lsg_fake_bus.o lsg_fake_device.o
++
+diff --git a/drivers/week13/README b/drivers/week13/README
+new file mode 100644
+index 000000000000..23037532c597
+--- /dev/null
++++ b/drivers/week13/README
+@@ -0,0 +1,25 @@
++Goals:
++	1. Surface the functionality of this driver to userspace 
++		Implement a char device to surface the driver functionality	
++
++ 
++1. Build the module uing the following command:
++
++	make -C ~/linux M=$PWD
++	
++
++
++2. Install the module 
++	sudo insmod lsg_bus.ko
++	sudo insmod lsg_drv.ko
++
++
++3. Check dmesg for messages! (sudo dmesg)
++
++4. Examine the sysfs directories (and files)  (sudo dmesg). You should be root to explore.
++	/sys/devices/LSG_DEV:0
++
++	/sys/bus/lsg_fake_bus
++
++4. Examine /dev directory. You should see a device by the name 
++
+diff --git a/drivers/week13/lsg_fake_bus.c b/drivers/week13/lsg_fake_bus.c
+new file mode 100644
+index 000000000000..0e57e2578acc
+--- /dev/null
++++ b/drivers/week13/lsg_fake_bus.c
+@@ -0,0 +1,209 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Implementation of the LSG Fake Bus.
++ * This is a synthetic bus. 
++ *
++ * Copyright (c) 2022, Microsoft Corporation.
++ *
++ * Author: K. Y. Srinivasan <kys@microsoft.com>
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++
++#include "lsgfk_public.h"
++
++
++/*
++ * If there is a match get the matching ID.
++ */
++static const struct lsgfkb_device_id *lsgfkb_get_id(const struct lsgfkb_device_id *id,
++						 enum lsg_dev_type dev_type)
++{
++	for (; id->dev_type != 0; id++)
++		if (id->dev_type == dev_type)
++			return id;
++	return NULL; 
++}
++
++/*
++ * LSG Fake Bus functions.
++ */
++
++static int lsgfk_bus_match(struct device *device, struct device_driver *driver)
++{
++	struct lsg_fake_device *dev = device_to_lsgfk_device(device);
++	struct lsg_fake_device_drv *drv = drv_to_lsgfk_driver(driver);
++
++        pr_info("Match invoked\n");
++	/* 
++	 * If a driver can handle multiple device types, see if this driver
++	 * can handle this device. 
++	 * Until now we assumed there was only one device and one driver.
++	 */
++	if (lsgfkb_get_id( drv->id_table, dev->dev_type))
++		return 1;
++	return 0;
++}
++
++static int lsgfk_bus_probe(struct device *child_device)
++{
++	int ret = 0;
++
++	struct lsg_fake_device_drv *drv = drv_to_lsgfk_driver(child_device->driver);
++
++	struct lsg_fake_device *dev = device_to_lsgfk_device(child_device);
++
++	const struct lsgfkb_device_id *dev_id;
++
++        pr_info("Probe invoked\n");
++
++	dev_id = lsgfkb_get_id(drv->id_table, dev->dev_type);
++
++	if (drv->probe) {
++		ret = drv->probe(dev, dev_id);
++		if (ret)
++			pr_err("probe failed for device %s (%d)\n",
++				dev_name(child_device), ret);
++	} else {
++		pr_err("probe not set for driver %s\n",
++			dev_name(child_device));
++		ret = -ENODEV;
++	}
++	return ret;
++}
++
++static void lsgfk_bus_remove(struct device *child_device)
++{
++	struct lsg_fake_device_drv *drv;
++
++	struct lsg_fake_device *dev = device_to_lsgfk_device(child_device);
++
++	pr_info("Remove invoked\n");
++
++	if (child_device ->driver) {
++		drv = drv_to_lsgfk_driver(child_device->driver);
++
++		if (drv->remove)
++			drv->remove(dev);
++	}
++}
++
++/*
++ * lsgfk_bus_uevent - add uevent for our device
++ *
++ * This routine is invoked when a device is added or removed on the bus to
++ * generate a uevent to udev in the userspace. The udev will then look at its
++ * rule and the uevent generated here to load the appropriate driver
++ *
++ * The alias string will be of the form lsgfkbus:type where type is the string
++ * representation of the device type.
++ */
++static int lsgfk_bus_uevent(struct device *device, struct kobj_uevent_env *env)
++{
++        struct lsg_fake_device *dev = device_to_lsgfk_device(device);
++        const char *format = "MODALIAS=lsgfkbus:%d";
++
++        return add_uevent_var(env, format, dev->dev_type);
++}
++
++static struct bus_type  lsgfk_bus = {
++	.name =		"lsg_fake_bus",
++	.match =	lsgfk_bus_match,
++	.probe =	lsgfk_bus_probe,
++	.remove =	lsgfk_bus_remove,
++	.uevent =	lsgfk_bus_uevent,
++};
++
++void lsgfk_bus_dev_release(struct device *dev)
++{
++
++        pr_info("dev_release invoked\n");
++}
++int lsg_fb_device_register(struct lsg_fake_device *fk_device)
++{
++        pr_info("Registering the LSG Fake Device\n");
++
++	/*
++	 * Initialize the device structure.
++	 */
++	dev_set_name(&fk_device->device, "LSG_DEV:%d", fk_device->dev_type);
++
++	fk_device->device.bus = &lsgfk_bus;
++	fk_device->device.release = lsgfk_bus_dev_release;
++
++	/*
++	 * Register the device with the Driver core.
++	 * This will kick off the driver/device
++	 * binding...which will eventually call match() and probe()
++	 */
++
++        pr_info("Registering the device\n");
++	return device_register(&fk_device->device);
++}
++
++EXPORT_SYMBOL_GPL(lsg_fb_device_register);
++
++int __lsg_fb_driver_register(struct lsg_fake_device_drv *drv,
++			     struct module *owner, const char *mod_name)
++{
++        pr_info("Registering driver %s\n", drv->name);
++
++	drv->driver.name = drv->name;
++	drv->driver.owner = owner;
++	drv->driver.mod_name = mod_name;
++	drv->driver.bus = &lsgfk_bus;
++
++	return driver_register(&drv->driver);
++}
++
++EXPORT_SYMBOL_GPL(__lsg_fb_driver_register);
++
++void lsg_fb_driver_unregister(struct lsg_fake_device_drv *drv)
++{
++        pr_info("Unregistering driver %s\n", drv->name);
++	driver_unregister(&drv->driver);
++}
++
++EXPORT_SYMBOL_GPL(lsg_fb_driver_unregister);
++
++static int __init init_lsg_fake_bus_drv(void)
++{
++	int ret;
++
++        pr_info("Initializing the LSG Fake Bus Driver\n");
++        pr_info("Registering the LSG Fake Bus\n");
++
++	ret = bus_register(&lsgfk_bus);
++	if (ret)
++		return ret;
++
++	/*
++	 * Create & initialize our device.
++ 	 */
++
++	return create_lsg_fake_device();
++
++}
++
++static void exit_lsg_fake_bus_drv(void)
++{
++	/*
++	 * Destroy our fake device.
++	 */
++
++	destroy_lsg_fake_device();
++	bus_unregister(&lsgfk_bus);
++        pr_info("De-initializing the LSG Fake Bus Driver\n");
++
++}
++
++
++
++module_init(init_lsg_fake_bus_drv);
++module_exit(exit_lsg_fake_bus_drv);
++
++
++MODULE_DESCRIPTION("LSG Fake Bus Driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/week13/lsg_fake_device.c b/drivers/week13/lsg_fake_device.c
+new file mode 100644
+index 000000000000..1761dc8156cb
+--- /dev/null
++++ b/drivers/week13/lsg_fake_device.c
+@@ -0,0 +1,171 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Implementation of the LSG Fake Device.
++ * This is a synthetice device.
++ *
++ * Copyright (c) 2022, Microsoft Corporation.
++ *
++ * Author: K. Y. Srinivasan <kys@microsoft.com>
++ */
++
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/types.h>
++#include <linux/slab.h>
++#include <linux/kthread.h>
++#include <linux/completion.h>
++
++#include "lsgfk_public.h"
++
++
++static struct lsg_fake_device *device_state;
++
++/*
++ * This function implements the functionality of the device.
++ */
++
++static void process_request(struct lsg_fake_device_mb *mb)
++{
++	pr_info("Processing a mailbox event in a seperate context\n");
++	switch (mb->verb) {
++	case LSG_FD_NO_OP:
++        	pr_info("Handling LSG_FD_NO_OP\n");
++		break;
++	/*
++	 * Here is where you would add code to implement
++	 * additional verbs.
++	 */
++	default:
++        	pr_info("Unknown verb: %d\n", mb->verb);
++		mb->errno = -EOPNOTSUPP;
++	}
++	
++	/*
++	 * Now notify completion.
++	 */	
++	if (mb->completion_cb)
++		mb->completion_cb(mb->cb_ctx);
++
++	/*
++	 * Now cleanup the mailbox state.
++	 */
++	mb->completion_cb = NULL;
++	mb->cb_ctx = NULL;
++	mb->verb = LSG_FD_NO_OP;
++}
++		
++
++
++/*
++ * This thread is woken up when the door bell is rung.
++ * This function executes ina thread context.
++ */
++static int device_thread_func(void *ctx)
++{
++	struct lsg_fake_device *dev_state = ctx;
++
++        pr_info("Starting the MB processing thread\n");
++
++	while (!kthread_should_stop()) {
++        	pr_info("MB Thread: waiting for work\n");
++		wait_for_completion(&dev_state->wait_event);
++                reinit_completion(&dev_state->wait_event);
++		if (!dev_state->destroyed)
++               		process_request(&dev_state->mb);
++        }
++
++       	pr_info("MB Thread exiting\n");
++        return 0;
++}
++
++
++static void ring_db(struct lsg_fake_device_mb *mb)
++{
++	struct lsg_fake_device *dev_state =
++		container_of(mb, struct lsg_fake_device, mb);
++
++	/*
++	 * For now,just signal completion.
++	 */
++
++        pr_info("Door Bell Rung\n");
++        pr_info("Waking up thread to process\n");
++
++	complete(&dev_state->wait_event);
++	
++}
++
++int create_lsg_fake_device(void)
++{
++	int ret = 0;
++        pr_info("Creating the LSG Fake Device\n");
++
++
++	/*
++	 * Allocate device specific state.
++	 */	
++	device_state = kzalloc(sizeof(*device_state), GFP_KERNEL);
++	if (!device_state)
++		return -ENOMEM; 
++
++	device_state->mb.ring_db = ring_db;
++	device_state->dev_type = NO_OP_DEV;
++	device_state->vendor_id = 0x1414; /* MSFT */
++	device_state->device_id = NO_OP_DEV; /* MSFT */
++	
++
++	/*
++	 * TBD: Home Work
++	 * Change the thread model to a work model
++	 * This code is to be written.
++	 */
++
++	init_completion(&device_state->wait_event);
++	device_state->thread = 
++		kthread_run(device_thread_func, device_state, "LSG_FAKE_DEV_THREAD");;
++
++	if (IS_ERR(device_state->thread)) {
++                ret = PTR_ERR(device_state->thread);
++		goto thread_err;
++        }
++
++	ret = lsg_fb_device_register(device_state);
++	if (ret) 
++		goto reg_err;
++
++	device_state->registered = true;
++	device_state->destroyed = false;
++	return 0;
++
++reg_err:
++	kthread_stop(device_state->thread);;
++
++thread_err:
++	
++	kfree(device_state);
++	return ret;
++}
++
++void destroy_lsg_fake_device(void)
++{
++        pr_info("Destroying the LSG Fake Device\n");
++	/*
++	 * Mark the device state as destroyed and wakeup the
++	 * processing thread to start the cleanup.
++	 */
++	device_state->destroyed = true;	
++	complete(&device_state->wait_event);	
++	if (!IS_ERR(device_state->thread))
++		kthread_stop(device_state->thread);
++	if (device_state->registered) {
++		device_unregister(&device_state->device);
++        	pr_info("Device unregistered\n");
++	}
++	kfree(device_state);
++       	pr_info("Device state freed\n");
++	
++}
++
+diff --git a/drivers/week13/lsg_fake_device_drv.c b/drivers/week13/lsg_fake_device_drv.c
+new file mode 100644
+index 000000000000..37b77a3ac443
+--- /dev/null
++++ b/drivers/week13/lsg_fake_device_drv.c
+@@ -0,0 +1,368 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Implementation of the LSG Fake Device Driver.
++ *
++ * Copyright (c) 2022, Microsoft Corporation.
++ *
++ * Author: K. Y. Srinivasan <kys@microsoft.com>
++ */
++
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/slab.h>
++#include <linux/kthread.h>
++#include <linux/completion.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/vmalloc.h>
++
++#include "lsgfk_public.h"
++
++
++/*
++ * The ID table for our driver.
++ * Currently handles only one device type.
++ * Also, no driver data.
++ */
++ 
++static const  struct lsgfkb_device_id  id_table[] = {
++	{ NO_OP_DEV, NULL},
++	{ },
++};
++MODULE_DEVICE_TABLE(lsgfkbus, id_table);
++/* MODULE_ALIAS("lsgfkbus:0"); */
++
++/*
++ * Per instance device state maintained by the driver.
++ */
++
++struct lsgfk_drv_state {
++	struct lsg_fake_device *dev;
++	spinlock_t lock; /* Protects the device busy state */
++	bool busy; /* Submit work only if !busy */
++	struct completion  wait_for_device_free; /* To serialize access */
++	struct completion  wait_for_op; /* Wait for outstanding transaction */
++
++	struct file_operations fops;	/* file operations */
++	struct miscdevice mdev; /* misc device */
++
++};
++
++static void test_the_device(struct lsgfk_drv_state *drv_state); /* Test code */
++/*
++ * Our device can only have one tranaction outstanding at any given point in time.
++ * Acquire the device for exclusive access.
++ */
++static void lgfk_get_device_exclusively(struct lsgfk_drv_state *drv_state)
++{
++	spin_lock(&drv_state->lock);
++
++	while (drv_state->busy) {
++		spin_unlock(&drv_state->lock);
++		wait_for_completion(&drv_state->wait_for_device_free);
++		spin_lock(&drv_state->lock);
++	}
++
++	/*
++	 * We hold the lock and the device is free. Acquire the device.
++	 */
++
++	drv_state->busy = true;
++	spin_unlock(&drv_state->lock);
++}
++
++static void lgfk_put_device(struct lsgfk_drv_state *drv_state)
++{
++	/*
++	 * Notify all the waiters that the device is available.
++	 * But, first set the state.
++	 */
++	
++	drv_state->busy = false;
++
++	complete_all(&drv_state->wait_for_device_free);
++	reinit_completion(&drv_state->wait_for_device_free);
++
++}
++
++static void op_completion(void *ctx)
++{
++	struct lsgfk_drv_state *drv_state = ctx;
++	
++	pr_info("Driver op completion invoked\n");
++	complete(&drv_state->wait_for_op);
++
++	lgfk_put_device(drv_state);	
++}
++
++static int lsgfk_drv_submit_work(struct lsgfk_drv_state *drv_state,
++				  enum lsg_fake_device_verbs verb,
++				  void *input, size_t input_length,
++				  void *output, size_t output_length)
++{
++	struct lsg_fake_device *dev = drv_state->dev;
++
++	/*
++	 * First get exclusive access to the device.
++	 */
++	lgfk_get_device_exclusively(drv_state);
++
++	/*
++	 * Now initialize the mailbox.
++	 */
++	dev->mb.cb_ctx = drv_state;
++	dev->mb.verb = verb;
++	dev->mb.completion_cb = op_completion;
++	dev->mb.input = input;
++	dev->mb.input_length = input_length;
++	dev->mb.output = output;
++	dev->mb.output_length = output_length;
++	dev->mb.errno = 0;
++	/*
++	 * Ring the door bell.
++	 */
++	pr_info("Ringing Door Bell\n");
++	dev->mb.ring_db(&dev->mb);
++	pr_info("Waiting for op completion\n");
++
++	/*
++	 * Wait for the device to complete the transaction we have
++	 * submitted.
++	 */
++	wait_for_completion(&drv_state->wait_for_op);
++
++	return dev->mb.errno;
++}
++
++static ssize_t lsgfk_drv_read(struct file *file, char __user *buf,
++			size_t count, loff_t *ppos)
++{
++	int ret = 0;
++	void *read_buffer;
++	/*
++	 * Get our driver state from struct file pointer.
++	 */
++	struct lsgfk_drv_state *drv_state = 
++		container_of(file->f_op, struct lsgfk_drv_state, fops);
++
++	pr_info("read invoked\n");
++	/*
++	 * This fake device can only handle one page of data.
++	 */
++	if (count > PAGE_SIZE)
++		return -EINVAL;
++
++	read_buffer = vmalloc(PAGE_SIZE);
++	if (!read_buffer)
++		return -ENOMEM;
++
++	
++	ret = lsgfk_drv_submit_work(drv_state, LSG_FD_READ, NULL, 0,
++				read_buffer, count);
++	if (ret)
++		goto free;
++
++	if (!copy_to_user(buf, read_buffer, count))
++		ret = count;
++	else
++		ret = -EFAULT;
++
++free:
++	vfree(read_buffer);
++	return ret;
++}
++
++static ssize_t lsgfk_drv_write(struct file *file, const char __user *buf,
++			size_t count, loff_t *ppos)
++{
++	int ret = 0;
++	void *write_buffer;
++
++	/*
++	 * Get our driver state from struct file pointer.
++	 */
++	struct lsgfk_drv_state *drv_state = 
++		container_of(file->f_op, struct lsgfk_drv_state, fops);
++
++	pr_info("write invoked\n");
++	/*
++	 * This fake device can only handle one page of data.
++	 */
++	if (count > PAGE_SIZE)
++		return -EINVAL;
++
++	write_buffer = vmalloc(PAGE_SIZE);
++	if (!write_buffer)
++		return -ENOMEM;
++
++	if (copy_from_user(write_buffer, buf, count)) {
++		vfree(write_buffer);
++		return -EFAULT;
++	}
++
++	ret = lsgfk_drv_submit_work(drv_state, LSG_FD_WRITE,
++				write_buffer, PAGE_SIZE,
++				NULL, 0);
++
++	vfree(write_buffer);
++	return ret ? ret : count;
++
++}
++
++static long lsgfk_drv_ioctl(struct file *file, unsigned int cmd,
++			unsigned long arg)
++{
++	pr_info("ioctl invoked\n");
++	return -ENOTSUPP;
++}
++
++static int lsgfk_drv_open(struct inode *inopdep, struct file *file)
++{
++	pr_info("open invoked\n");
++	return 0;
++}
++
++static int lsgfk_drv_probe(struct lsg_fake_device *dev,
++			   const struct lsgfkb_device_id *dev_id)
++{
++	int ret = 0;
++	struct lsgfk_drv_state *drv_state;
++	pr_info("Probe invoked\n");
++
++	drv_state = kzalloc(sizeof(*drv_state), GFP_KERNEL);
++
++	if (!drv_state)
++		return -ENOMEM;
++
++	drv_state->dev = dev;
++	drv_state->busy = false;
++	spin_lock_init(&drv_state->lock);
++
++	init_completion(&drv_state->wait_for_device_free);
++	init_completion(&drv_state->wait_for_op);
++
++
++	/*
++	 * Surface the functionality as a misc char device.
++	 */
++	drv_state->mdev.minor = MISC_DYNAMIC_MINOR;
++
++	/*
++	 * We will driver nodes of the form:
++	 * driver_name:device_name.
++	 * It is this device that the user-level code can open
++	 * to communicate with the device.
++	 */
++	drv_state->mdev.name = dev_name(&dev->device);
++
++	drv_state->fops.owner = THIS_MODULE;
++	drv_state->fops.open = lsgfk_drv_open;
++	drv_state->fops.read = lsgfk_drv_read; 
++	drv_state->fops.write = lsgfk_drv_write; 
++	drv_state->fops.compat_ioctl = lsgfk_drv_ioctl; 
++	drv_state->fops.unlocked_ioctl = lsgfk_drv_ioctl; 
++
++	drv_state->mdev.fops = &drv_state->fops;
++
++	/*
++	 * Register the misc device.
++	 */
++
++	ret = misc_register(&drv_state->mdev);
++	if (ret) {
++		kfree(drv_state);
++		return ret;
++	}
++
++	/*
++	 * Register the driver data with the device.
++	 */
++	lsgfk_set_drvdata(dev, drv_state);
++
++	/*
++	 * This is test code. TEMP code
++	 */
++	test_the_device(drv_state);
++	return 0; 
++}
++
++static int lsgfk_drv_remove(struct lsg_fake_device *dev)
++{
++	struct lsgfk_drv_state *drv_state;
++	pr_info("Remove invoked\n");
++
++	drv_state = lsgfk_get_drvdata(dev);
++	misc_deregister(&drv_state->mdev);
++	kfree(drv_state);
++	return 0;
++}
++
++static struct lsg_fake_device_drv lsgfk_dev_drv = {
++	.name = "LSG_FAKE_DEV_DRV",
++	.id_table = id_table, /* The IDs this driver can handle */
++	.probe = lsgfk_drv_probe,
++	.remove = lsgfk_drv_remove,
++};
++
++static int __init init_lsg_fake_dev_drv(void)
++{
++	pr_info("Initializing the LSG Fake Device Driver\n");
++	pr_info("Registering the  Driver\n");
++
++	return lsg_fb_driver_register(&lsgfk_dev_drv);
++}
++
++static void  exit_lsg_fake_dev_drv(void)
++{
++	pr_info("Exiting the LSG Fake Device Driver\n");
++	pr_info("Unregistering the  Driver\n");
++	lsg_fb_driver_unregister(&lsgfk_dev_drv);
++}
++
++/*
++ * Driver test code.
++ */
++
++static void test_completion(void *ctx)
++{
++	struct lsgfk_drv_state *drv_state = ctx;
++	
++	pr_info("Client completion invoked\n");
++	complete(&drv_state->wait_for_op);
++
++	lgfk_put_device(drv_state);	
++}
++
++static void test_the_device(struct lsgfk_drv_state *drv_state)
++{
++	struct lsg_fake_device *dev = drv_state->dev;
++
++	lgfk_get_device_exclusively(drv_state);
++
++	dev->mb.cb_ctx = drv_state;
++	dev->mb.verb = LSG_FD_NO_OP;
++	dev->mb.completion_cb = test_completion;
++	/*
++	 * Ring the door bell.
++	 */
++	pr_info("Ringing Door Bell\n");
++	dev->mb.ring_db(&dev->mb);
++	pr_info("Waiting for op completion\n");
++
++	/*
++	 * Wait for the device to complete the transaction we have
++	 * submitted.
++	 */
++	wait_for_completion(&drv_state->wait_for_op);
++	pr_info("Test completed!!!\n");
++}
++module_init(init_lsg_fake_dev_drv);
++module_exit(exit_lsg_fake_dev_drv);
++
++
++MODULE_DESCRIPTION("LSG Fake Device Driver");
++MODULE_LICENSE("GPL");
++
+diff --git a/drivers/week13/lsgfk_public.h b/drivers/week13/lsgfk_public.h
+new file mode 100644
+index 000000000000..a0009cec58f9
+--- /dev/null
++++ b/drivers/week13/lsgfk_public.h
+@@ -0,0 +1,161 @@
++/*PDX-License-Identifier: GPL-2.0-only */
++/*
++ * Definitions for the LSG Fake Bus/Device/Driver 
++ *
++ * Copyright (c) 2022, Microsoft Corporation.
++ *
++ * Author: K. Y. Srinivasan <kys@microsoft.com>
++ */
++
++#ifndef _LSG_FAKE_PUBLIC_H
++#define _LSG_FAKE_PUBLIC_H
++
++#include <linux/types.h>
++#include <linux/device.h>
++#include <linux/completion.h>
++#include <linux/kthread.h>
++
++/*
++ * This define should be in include/linux/mod_devicetable.h
++ */
++
++struct lsgfkb_device_id {
++	int dev_type;
++	/*kernel_ulong_t driver_data; */
++	void *driver_data; /*Temporary*/
++	
++};
++
++enum lsg_fake_device_verbs {
++        LSG_FD_NO_OP,
++        LSG_FD_READ,
++        LSG_FD_WRITE,
++        LSG_FD_IOCTL,
++        /*
++         * Other verbs.
++         */
++};
++
++enum lsg_dev_type {
++	NO_OP_DEV = 1,
++	/*
++	 * Other Device types.
++	 */
++};
++
++
++/*
++ * Device specific state.
++ * Interactions with this device are through a mail box. This device supports only
++ * one outstandaing transaction at a time and the driver is responsible for
++ * ensuring this. Here are the details of the mailbox:
++ *
++ * ring_db:		This is to ring the door bell. Once the work related fields are
++ *         		setup, the driver is expected to invoke this function to start the processing.
++ *         		The device behavior is unspecified, if the door bell is rung without properly
++ *			submitting the work.
++ * 
++ * completion_cb:	The evice will invoke this function when the device processing is done.
++ * 			The driver is expected to register this function for each transaction
++ *			submitted.
++ * cb_ctx:		This is fdriver specific context that is passed to the completion callback.
++ * verb:		Specifies the action to be performed.
++ * input		pointer to the input data
++ * input_length		size of the input data
++ * output		pointer to the output data where the device will present the results
++ * output_length	size of the output buffer
++ * errno		!0 indicates error from the device
++ */
++
++struct lsg_fake_device_mb {
++	void (*ring_db)(struct lsg_fake_device_mb *);
++	void (*completion_cb)(void *);
++	void *cb_ctx;
++	enum lsg_fake_device_verbs verb;
++	void *input;
++	size_t input_length;
++	void *output;
++	size_t output_length;
++	int errno;
++};
++
++/*
++ * LSG Fake Device State.
++ */
++struct lsg_fake_device {
++	enum lsg_dev_type dev_type;
++	u16 vendor_id;
++	u16 device_id;
++	struct completion  wait_event;
++	struct task_struct *thread;
++	bool destroyed;
++	bool registered;
++
++	/*
++	 * Embed the Linux device.
++	 */
++	struct device device;
++
++        struct lsg_fake_device_mb mb;
++};
++
++/*
++ * LSG Fake Device Driver State.
++ */
++struct lsg_fake_device_drv {
++	char *name;
++	/*
++	 * Embed the Linux driver object.
++	 */
++	struct device_driver driver;
++	/*
++	 * ID Table. The devices the driver can handle.
++	 */
++	const struct lsgfkb_device_id *id_table;
++
++	int (*probe)(struct lsg_fake_device *, const struct lsgfkb_device_id *);
++	int (*remove)(struct lsg_fake_device *);
++	
++};
++
++static inline struct lsg_fake_device *device_to_lsgfk_device(struct device *d)
++{
++        return container_of(d, struct lsg_fake_device, device);
++}
++
++static inline struct lsg_fake_device_drv *drv_to_lsgfk_driver(struct device_driver *drv)
++{
++        return container_of(drv, struct lsg_fake_device_drv, driver);
++}
++/*
++ * APIs exposed by the device/bus.
++ */
++
++
++#define lsg_fb_driver_register(driver)   \
++        __lsg_fb_driver_register(driver, THIS_MODULE, KBUILD_MODNAME)
++
++int __must_check __lsg_fb_driver_register(struct lsg_fake_device_drv *drv,
++                                         struct module *owner,
++                                         const char *mod_name);
++
++static inline void lsgfk_set_drvdata(struct lsg_fake_device *dev, void *data)
++{
++	dev_set_drvdata(&dev->device, data);
++}
++ 
++static inline void *lsgfk_get_drvdata(struct lsg_fake_device *dev)
++{
++	return dev_get_drvdata(&dev->device);
++}
++
++void lsg_fb_driver_unregister(struct lsg_fake_device_drv *drv);
++
++int  create_lsg_fake_device(void);
++
++void destroy_lsg_fake_device(void);
++
++int lsg_fb_device_register(struct lsg_fake_device *);
++
++
++#endif /* _LSG_FAKE_PUBLIC_H */
+diff --git a/include/linux/mod_devicetable.h b/include/linux/mod_devicetable.h
+index 4bb71979a8fd..9dfd1ad40dd9 100644
+--- a/include/linux/mod_devicetable.h
++++ b/include/linux/mod_devicetable.h
+@@ -446,6 +446,11 @@ struct hv_vmbus_device_id {
+ 	kernel_ulong_t driver_data;	/* Data private to the driver */
+ };
+ 
++struct lsgfkbus_device_id {
++	int dev_type;
++	void *driver_data;
++};
++
+ /* rpmsg */
+ 
+ #define RPMSG_NAME_SIZE			32
+diff --git a/scripts/mod/devicetable-offsets.c b/scripts/mod/devicetable-offsets.c
+index c0d3bcb99138..dc2da513a6fe 100644
+--- a/scripts/mod/devicetable-offsets.c
++++ b/scripts/mod/devicetable-offsets.c
+@@ -140,6 +140,9 @@ int main(void)
+ 	DEVID(hv_vmbus_device_id);
+ 	DEVID_FIELD(hv_vmbus_device_id, guid);
+ 
++	DEVID(lsgfkbus_device_id);
++	DEVID_FIELD(lsgfkbus_device_id, dev_type);
++
+ 	DEVID(rpmsg_device_id);
+ 	DEVID_FIELD(rpmsg_device_id, name);
+ 
+diff --git a/scripts/mod/file2alias.c b/scripts/mod/file2alias.c
+index 5258247d78ac..9d83420d6cae 100644
+--- a/scripts/mod/file2alias.c
++++ b/scripts/mod/file2alias.c
+@@ -923,6 +923,16 @@ static int do_vmbus_entry(const char *filename, void *symval,
+ 	return 1;
+ }
+ 
++/* Looks like: lsgfkbus:u */
++static int do_lsgfkbus_entry(const char *filename, void *symval,
++			  char *alias)
++{
++	DEF_FIELD_ADDR(symval, lsgfkbus_device_id, dev_type);
++
++	sprintf(alias, "lsgfkbus:%u", *dev_type);
++
++	return 1;
++}
+ /* Looks like: rpmsg:S */
+ static int do_rpmsg_entry(const char *filename, void *symval,
+ 			  char *alias)
+@@ -1494,6 +1504,7 @@ static const struct devtable devtable[] = {
+ 	{"bcma", SIZE_bcma_device_id, do_bcma_entry},
+ 	{"virtio", SIZE_virtio_device_id, do_virtio_entry},
+ 	{"vmbus", SIZE_hv_vmbus_device_id, do_vmbus_entry},
++	{"lsgfkbus", SIZE_lsgfkbus_device_id, do_lsgfkbus_entry},
+ 	{"rpmsg", SIZE_rpmsg_device_id, do_rpmsg_entry},
+ 	{"i2c", SIZE_i2c_device_id, do_i2c_entry},
+ 	{"i3c", SIZE_i3c_device_id, do_i3c_entry},
+-- 
+2.23.4
+
